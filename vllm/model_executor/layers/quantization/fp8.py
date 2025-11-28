@@ -661,6 +661,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self.fp8_backend == Fp8MoeBackend.CUTLASS_BLOCK_SCALED_GROUPED_GEMM
         )
 
+        logger.info_once("="*70)
+        logger.info_once(f"{self.flashinfer_moe_backend=!r} {self.fp8_backend=!r} {self.allow_deep_gemm=!r} {self.allow_cutlass_block_scaled_grouped_gemm=!r}")
+        logger.info_once("="*71)
+
     def create_weights(
         self,
         layer: Module,

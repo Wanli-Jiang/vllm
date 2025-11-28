@@ -82,6 +82,11 @@ from vllm.utils.flashinfer import (
     has_flashinfer,
     has_flashinfer_moe,
 )
+from vllm.utils.import_utils import has_deep_gemm
+from vllm.utils.deep_gemm import (
+    is_deep_gemm_e8m0_used,
+    is_deep_gemm_supported,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
@@ -470,8 +475,13 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if self.quant_config.is_block_quant:
+            # williamj: Should we use reciprocal() here?
+            # From slack thread and the scale value, I guess no.
+            # layer.weight_scale = Parameter(
+            #     layer.weight_scale.reciprocal().squeeze(), requires_grad=False
+            # )
             layer.weight_scale = Parameter(
-                layer.weight_scale.reciprocal().squeeze(), requires_grad=False
+                layer.weight_scale.squeeze(), requires_grad=False
             )
 
         if not self.quant_config.is_block_quant:
@@ -532,6 +542,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
 
         self.cutlass_fp8_supported = cutlass_fp8_supported()
         self.flashinfer_moe_backend: FlashinferMoeBackend | None = None
+        self.moe_backend: str | None = None
         if envs.VLLM_USE_FLASHINFER_MOE_FP8 and has_flashinfer_moe():
             self.flashinfer_moe_backend = get_flashinfer_moe_backend()
             if (
@@ -547,6 +558,27 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             logger.info_once(
                 f"Using FlashInfer {self.flashinfer_moe_backend.value} kernels"
             )
+
+        self.moe_backend = self.flashinfer_moe_backend
+
+        # deepGEMM on supported platforms with block-quantized weights
+        if envs.VLLM_USE_DEEP_GEMM and envs.VLLM_MOE_USE_DEEP_GEMM and self.quant_config.is_block_quant:
+            if not has_deep_gemm():
+                logger.warning_once("="*48)
+                logger.warning_once("DeepGEMM backend requested but not available.")
+                logger.warning_once("="*49)
+            elif is_deep_gemm_supported():
+                logger.info_once("="*50)
+                logger.info_once("Using DeepGEMM backend for FP8 MoE")
+                logger.info_once("="*51)
+                self.flashinfer_moe_backend = None
+                self.moe_backend = "DeepGEMM"
+
+        logger.info_once("="*52)
+        logger.info_once(f"{self.cutlass_fp8_supported=!r} {self.flashinfer_moe_backend=!r} {self.moe_backend=!r}")
+        logger.info_once(f"{envs.VLLM_USE_DEEP_GEMM=!r} {envs.VLLM_MOE_USE_DEEP_GEMM=!r} {self.quant_config.is_block_quant=!r}")
+        logger.info_once(f"{envs.VLLM_USE_FLASHINFER_MOE_FP8=!r} {has_flashinfer_moe=!r}")
+        logger.info_once("="*53)
 
     def maybe_make_prepare_finalize(
         self,
@@ -721,11 +753,17 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         block_shape = self.quant_config.block_size
         assert block_shape is not None
 
+        # layer.w13_weight_scale = Parameter(
+        #     layer.w13_weight_scale.reciprocal().squeeze(), requires_grad=False
+        # )
+        # layer.w2_weight_scale = Parameter(
+        #     layer.w2_weight_scale.reciprocal().squeeze(), requires_grad=False
+        # )
         layer.w13_weight_scale = Parameter(
-            layer.w13_weight_scale.reciprocal().squeeze(), requires_grad=False
+            layer.w13_weight_scale.squeeze(), requires_grad=False
         )
         layer.w2_weight_scale = Parameter(
-            layer.w2_weight_scale.reciprocal().squeeze(), requires_grad=False
+            layer.w2_weight_scale.squeeze(), requires_grad=False
         )
 
         required_padding = w13_weight.size(-2) % block_shape[0]
@@ -889,6 +927,10 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             if self.quant_config.is_block_quant:
                 import vllm.model_executor.layers.fused_moe.flashinfer_trtllm_moe  # noqa: E501, F401
 
+                logger.info_once("="*60)
+                logger.info_once("!!! Using FlashInfer TRTLLM backend for FP8 MoE !!!")
+                logger.info_once("="*61)
+
                 e_score_correction_bias = (
                     e_score_correction_bias.to(x.dtype)
                     if e_score_correction_bias is not None
@@ -947,6 +989,11 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         )
 
         if self.flashinfer_moe_backend == FlashinferMoeBackend.CUTLASS:
+
+            logger.info_once("="*62)
+            logger.info_once("!!! Using FlashInfer CUTLASS backend for FP8 MoE !!!")
+            logger.info_once("="*63)
+
             assert activation in ("silu", "relu2_no_mul"), (
                 "Expected activation to be in ('silu', 'relu2_no_mul'),"
                 f"but got {activation}"
@@ -968,6 +1015,15 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
 
             assert self.moe_quant_config is not None
 
+            logger.info_once("="*64)
+            if self.moe_backend == "DeepGEMM":
+                logger.info_once("!!! Using DeepGEMM backend for FP8 MoE !!!")
+            else:
+                logger.info_once("!!! Using Triton backend for FP8 MoE !!!")
+            logger.info_once(f"!!! {self.moe_backend=!r} !!!")
+            logger.info_once(f"!!! {(self.moe_backend == "DeepGEMM")=!r} !!!")
+            logger.info_once("="*65)
+
             return fused_experts(
                 x,
                 layer.w13_weight,
@@ -981,6 +1037,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 expert_map=expert_map,
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 allow_cutlass_block_scaled_grouped_gemm=self.quant_config.is_block_quant,
+                allow_deep_gemm=self.moe_backend == "DeepGEMM",
             )
 
 

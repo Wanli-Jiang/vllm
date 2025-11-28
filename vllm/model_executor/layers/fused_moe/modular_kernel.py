@@ -568,7 +568,10 @@ class FusedMoEPermuteExpertsUnpermute(ABC):
     def activation(
         self, activation: str, output: torch.Tensor, input: torch.Tensor
     ) -> None:
-        assert output.size(-1) * 2 == input.size(-1)
+        if activation == "relu2_no_mul":
+            assert output.size(-1) == input.size(-1)
+        else:
+            assert output.size(-1) * 2 == input.size(-1)
         if activation == "silu":
             torch.ops._C.silu_and_mul(output, input)
         elif activation == "gelu":
@@ -576,6 +579,8 @@ class FusedMoEPermuteExpertsUnpermute(ABC):
         elif activation == "swigluoai":
             # alpha = 1.702, limit = 7.0
             torch.ops._C.swigluoai_and_mul(output, input)
+        elif activation == "relu2_no_mul":
+            output = torch.square(torch.relu(input))
         else:
             raise ValueError(f"Unsupported FusedMoe activation: {activation}")
 

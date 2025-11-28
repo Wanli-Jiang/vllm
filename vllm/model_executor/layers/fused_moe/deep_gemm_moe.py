@@ -216,7 +216,7 @@ class DeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
         assert M_sum % block_m == 0
 
         workspace1 = (M_sum, N)
-        workspace2 = (M_sum, max(N // 2, K))
+        workspace2 = (M_sum, max(N, K))   # Request more space for now.
         output = (M, K)
         return (workspace1, workspace2, output)
 
@@ -261,11 +261,16 @@ class DeepGemmExperts(mk.FusedMoEPermuteExpertsUnpermute):
             expert_tokens_meta=expert_tokens_meta,
         )
 
+        if activation == "relu2_no_mul":
+            ratio = 1
+        else:
+            ratio = 2
+
         a1q_perm = _resize_cache(workspace2.view(dtype=torch.float8_e4m3fn), (M_sum, K))
         mm1_out = _resize_cache(workspace13, (M_sum, N))
-        act_out = _resize_cache(workspace2, (M_sum, N // 2))
+        act_out = _resize_cache(workspace2, (M_sum, N // ratio))
         quant_out = _resize_cache(
-            workspace13.view(dtype=torch.float8_e4m3fn), (M_sum, N // 2)
+            workspace13.view(dtype=torch.float8_e4m3fn), (M_sum, N // ratio)
         )
         mm2_out = _resize_cache(workspace2, (M_sum, K))
 

@@ -300,9 +300,14 @@ def ep_gather(
     num_warps = 2
     num_tokens = output_tensor.shape[0]
     hidden_size = input_tensor.shape[1]
-    BLOCK_D = min(hidden_size, 1024)
+
+    # wj: since hidden_size is 2688, we need to change BLOCK_D from 1024 to 128?
+    # make sure BLOCK_D is a pow of 2, and hidden_size is divisible by BLOCK_D
+    TMP = 128  # Previous is 1024.
+    BLOCK_D = min(hidden_size, TMP)
+
     assert hidden_size % BLOCK_D == 0
-    grid = (triton.cdiv(hidden_size, BLOCK_D), min(num_tokens, 1024))
+    grid = (triton.cdiv(hidden_size, BLOCK_D), min(num_tokens, TMP))
 
     _fwd_kernel_ep_gather[grid](
         num_tokens,
