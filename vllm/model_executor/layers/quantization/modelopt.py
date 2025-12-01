@@ -53,7 +53,10 @@ from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     select_cutlass_fp8_gemm_impl,
     swap_w13_to_w31,
 )
-from vllm.model_executor.layers.quantization.utils.fp8_utils import W8A8BlockFp8LinearOp
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    W8A8BlockFp8LinearOp,
+    deepgemm_post_process_fp8_weight_block,
+)
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
     apply_fp4_marlin_linear,
     is_fp4_marlin_supported,
@@ -753,12 +756,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         block_shape = self.quant_config.block_size
         assert block_shape is not None
 
-        # layer.w13_weight_scale = Parameter(
-        #     layer.w13_weight_scale.reciprocal().squeeze(), requires_grad=False
-        # )
-        # layer.w2_weight_scale = Parameter(
-        #     layer.w2_weight_scale.reciprocal().squeeze(), requires_grad=False
-        # )
+        # Squeeze the scales first
         layer.w13_weight_scale = Parameter(
             layer.w13_weight_scale.squeeze(), requires_grad=False
         )
@@ -766,6 +764,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight_scale.squeeze(), requires_grad=False
         )
 
+        # Apply padding if needed
         required_padding = w13_weight.size(-2) % block_shape[0]
         if required_padding != 0:
             layer.w13_weight = Parameter(
@@ -777,11 +776,37 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
 
+        # FlashInfer weight transformations (must be done before DeepGEMM preprocessing)
         if self.flashinfer_moe_backend is not None:
             if self.moe.is_act_and_mul:
                 layer.w13_weight.data = swap_w13_to_w31(layer.w13_weight.data)
             if self.flashinfer_moe_backend == FlashinferMoeBackend.TENSORRT_LLM:
                 rotate_flashinfer_fp8_moe_weights(layer.w13_weight, layer.w2_weight)
+
+        # DeepGEMM preprocessing: transpose and align scales
+        # This must be done AFTER FlashInfer transformations
+        if self.moe_backend == "DeepGEMM":
+            logger.info_once("Preprocessing weights for DeepGEMM backend")
+            dg_w13_weight, dg_w13_weight_scale = (
+                deepgemm_post_process_fp8_weight_block(
+                    wq=layer.w13_weight.data,
+                    ws=layer.w13_weight_scale.data,
+                    quant_block_shape=tuple(block_shape),
+                    use_e8m0=is_deep_gemm_e8m0_used(),
+                )
+            )
+            dg_w2_weight, dg_w2_weight_scale = (
+                deepgemm_post_process_fp8_weight_block(
+                    wq=layer.w2_weight.data,
+                    ws=layer.w2_weight_scale.data,
+                    quant_block_shape=tuple(block_shape),
+                    use_e8m0=is_deep_gemm_e8m0_used(),
+                )
+            )
+            layer.w13_weight = Parameter(dg_w13_weight, requires_grad=False)
+            layer.w13_weight_scale = Parameter(dg_w13_weight_scale, requires_grad=False)
+            layer.w2_weight = Parameter(dg_w2_weight, requires_grad=False)
+            layer.w2_weight_scale = Parameter(dg_w2_weight_scale, requires_grad=False)
 
     def _process_weights_after_loading_per_tensor(self, layer: torch.nn.Module) -> None:
         """Process FP8 MoE weights after loading from serialized checkpoint.

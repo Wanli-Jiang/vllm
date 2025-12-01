@@ -79,6 +79,9 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs import NemotronHConfig
 
 
+SHOW_FLAG = True
+LAYER_IDX = 1
+
 class NemotronHMLP(nn.Module):
     def __init__(
         self,
@@ -201,7 +204,7 @@ class NemotronHMoE(nn.Module):
             is_sequence_parallel=self.is_sequence_parallel,
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, show: bool = False) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
@@ -209,13 +212,30 @@ class NemotronHMoE(nn.Module):
             hidden_states = sequence_parallel_chunk(hidden_states)
 
         # router_logits: (num_tokens, n_experts)
+
+        if show:
+            print("="*100)
+            print(f"Layer {LAYER_IDX} gate input: {hidden_states.shape=!r} {hidden_states.dtype=!r} {hidden_states.device=!r} {hidden_states=!r}")
+            print("="*100)
+
         router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
 
+        if show:
+            print("="*100)
+            print(f"Layer {LAYER_IDX} gate output: {router_logits.shape=!r} {router_logits.dtype=!r} {router_logits.device=!r} {router_logits=!r}")
+            print("="*100)
+
         fused_moe_out = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
+            hidden_states=hidden_states, router_logits=router_logits, show=show,
         )
 
         shared_output, final_hidden_states = fused_moe_out
+
+        if show:
+            print("="*100)
+            print(f"Layer {LAYER_IDX} shared_output output: {shared_output.shape=!r} {shared_output.dtype=!r} {shared_output.device=!r} {shared_output=!r}")
+            print(f"Layer {LAYER_IDX} final_hidden_states output: {final_hidden_states.shape=!r} {final_hidden_states.dtype=!r} {final_hidden_states.device=!r} {final_hidden_states=!r}")
+            print("="*100)
 
         # Fix FP16 overflow
         # See DeepseekV2DecoderLayer for more details.
@@ -327,8 +347,55 @@ class NemotronHMoEDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
 
-        hidden_states = self.mixer(hidden_states)
+        show = kwargs["show"]
+
+        if show:
+            print("="*100)
+            print(f"Layer {LAYER_IDX} input: {hidden_states.shape=!r} {hidden_states.dtype=!r} {hidden_states.device=!r} {hidden_states=!r}")
+            print("="*100)
+
+        hidden_states = self.mixer(hidden_states, show=show)
+
+        if show:
+            print("="*100)
+            print(f"Layer {LAYER_IDX} output: {hidden_states.shape=!r} {hidden_states.dtype=!r} {hidden_states.device=!r} {hidden_states=!r}")
+            print("="*100)
+
         return hidden_states, residual
+
+
+def dequantize_fp8_pb_wo_to_bf16(weight: torch.Tensor,
+                                 weight_scale: torch.Tensor,
+                                 block_m: int = 128,
+                                 block_n: int = 128) -> torch.Tensor:
+    """
+    Dequantize ModelOpt fp8_pb_wo weights to bfloat16.
+    weight:       [M, N] FP8 tensor
+    weight_scale: [M/block_m, N/block_n] scale tensor
+    Returns:      [M, N] BF16 tensor
+    """
+    M, N = weight.shape
+
+    print(f"dequantize_fp8_pb_wo_to_bf16: {weight.shape=!r} {weight_scale.shape=!r}")
+
+    assert M % block_m == 0 and N % block_n == 0, "Incompatible block size"
+    num_blocks_m = M // block_m
+    num_blocks_n = N // block_n
+    assert weight_scale.shape == (num_blocks_m, num_blocks_n)
+
+    # Reshape weight into blocks: [num_blocks_m, block_m, num_blocks_n, block_n]
+    w_blocks = weight.view(num_blocks_m, block_m, num_blocks_n, block_n)
+
+    # Broadcast scales to block shape: [num_blocks_m, 1, num_blocks_n, 1]
+    scales = weight_scale.to(torch.bfloat16).view(num_blocks_m, 1, num_blocks_n, 1)
+
+    # Dequantize: fp8 -> bf16, then multiply by scale
+    w_dequant = w_blocks.to(torch.bfloat16) * scales
+
+    # Reshape back to [M, N]
+    w_dequant = w_dequant.view(M, N)
+
+    return w_dequant
 
 
 class NemotronHMambaDecoderLayer(nn.Module):
@@ -376,7 +443,38 @@ class NemotronHMambaDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
 
+        show = kwargs["show"]
+
+        if show:
+            print("="*100)
+            print(f"Layer {LAYER_IDX} input: {hidden_states.shape=!r} {hidden_states.dtype=!r} {hidden_states.device=!r} {hidden_states=!r}")
+            print("="*100)
+
+        if show:
+            print("="*100)
+            # Print all parameter weights for self.mixer
+            print(f"Layer {LAYER_IDX} mixer parameter weights:")
+            in_proj_weight, in_proj_weight_scale = None, None
+            for name, param in self.mixer.named_parameters():
+                print(f"  {name}: {param.shape} dtype={param.dtype} device={param.device} values: {param.data}")
+
+                if name == "in_proj.weight":
+                    in_proj_weight = param
+                elif name == "in_proj.weight_scale":
+                    in_proj_weight_scale = param
+
+            if in_proj_weight is not None and in_proj_weight_scale is not None:
+                in_proj_weight_dq = dequantize_fp8_pb_wo_to_bf16(in_proj_weight, in_proj_weight_scale)
+                print(f"Layer {LAYER_IDX} in_proj_dequantized: {in_proj_weight_dq.shape=!r} {in_proj_weight_dq.dtype=!r} {in_proj_weight_dq.device=!r} {in_proj_weight_dq=!r}")
+            print("="*100)
+
         output = self.mixer(hidden_states)
+
+        if show:
+            print("="*100)
+            print(f"Layer {LAYER_IDX} output: {output.shape=!r} {output.dtype=!r} {output.device=!r} {output=!r}")
+            print("="*100)
+
         return output, residual
 
 
@@ -547,6 +645,12 @@ class NemotronHModel(nn.Module):
 
         self.norm_f = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
+        print("="*100)
+        print(f"{self.start_layer=!r}")
+        print(f"{self.end_layer=!r}")
+        print(f"{self.layers=!r}")
+        print("="*100)
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -568,11 +672,15 @@ class NemotronHModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        for layer_idx, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer)):
+
+            show = layer_idx == LAYER_IDX and SHOW_FLAG and hidden_states.shape[0] == 6
+
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
+                show=show,
             )
 
         if not get_pp_group().is_last_rank:
@@ -607,13 +715,32 @@ class NemotronHModel(nn.Module):
             expert_params_mapping = []
 
         params_dict = dict(self.named_parameters())
+
+
+        # print("="*100)
+        # print(f" expert_params_mapping: {expert_params_mapping=!r}")
+        # for k, v in params_dict.items():
+        #     if "layers.20." in k:
+        #         print(f" {k=!r} {v.shape=!r} {v.dtype=!r} {v.device=!r}")
+        # print("="*100)
+
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
+
+            # show = "layers.20." in name
+            # if show:
+            #     print("="*100)
+            #     print(f" 1: {name=!r} {loaded_weight.shape=!r} {loaded_weight.dtype=!r} {loaded_weight.device=!r}")
+
+
             if "scale" in name:
                 # Remapping the name of FP8 kv-scale.
                 name = maybe_remap_kv_scale_name(name, params_dict)
                 if name is None:
                     continue
+
+            # if show:
+            #     print(f" after maybe_remap_kv_scale_name: {name=!r} {loaded_weight.shape=!r} {loaded_weight.dtype=!r} {loaded_weight.device=!r}")
 
             # load stacked params
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -640,6 +767,9 @@ class NemotronHModel(nn.Module):
                     if weight_name not in name:
                         continue
 
+                    # if show:
+                    #     print(f" 2: {name=!r} {weight_name=!r} {param_name=!r} {expert_id=!r} {shard_id=!r}")
+
                     # Anyway, this is an expert weight and should not be
                     # attempted to load as other weights later
                     is_expert_weight = True
@@ -647,6 +777,9 @@ class NemotronHModel(nn.Module):
                     # Do not modify `name` since the loop may continue here
                     # Instead, create a new variable
                     name_mapped = name.replace(weight_name, param_name)
+
+                    # if show:
+                    #     print(f" 3: {name_mapped=!r}")
 
                     if is_pp_missing_parameter(name_mapped, self):
                         continue

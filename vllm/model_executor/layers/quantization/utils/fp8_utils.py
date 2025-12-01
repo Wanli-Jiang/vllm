@@ -209,9 +209,11 @@ class W8A8BlockFp8LinearOp:
         cutlass_block_fp8_supported: bool = CUTLASS_BLOCK_FP8_SUPPORTED,
         use_aiter_and_is_supported: bool = False,
     ):
+        cutlass_block_fp8_supported = True   # Force to use cutlass
+        self.force_cutlass = cutlass_block_fp8_supported
         self.weight_group_shape = weight_group_shape
         self.act_quant_group_shape = act_quant_group_shape
-        self.is_deep_gemm_supported = is_deep_gemm_supported()
+        self.is_deep_gemm_supported = is_deep_gemm_supported() and not self.force_cutlass
         self.is_hopper = current_platform.is_device_capability(90)
         self.use_deep_gemm_e8m0 = is_deep_gemm_e8m0_used()
 
@@ -252,6 +254,8 @@ class W8A8BlockFp8LinearOp:
         if should_use_deepgemm_for_fp8_linear(
             output_dtype, weight, self.is_deep_gemm_supported
         ):
+            if self.force_cutlass:
+                raise IOError("stop here")
             output = self._run_deepgemm(input_2d, weight, weight_scale)
         else:
             output = self.w8a8_blockscale_op(

@@ -49,7 +49,10 @@ The following models are in computelab cluster, see `/home/scratch.williamj_core
 
 # llm = LLM(model="/code/wj-models/Nemotron-Nano-3-30B-A3.5B-dev-1024_fp8_pb_wo", trust_remote_code=True)
 # llm = LLM(model="/code/wj-models/Nemotron-Nano-3-30B-A3.5B-dev-1024-wj-no-moe", trust_remote_code=True)
-llm = LLM(model="/code/wj-models/Nemotron-Nano-3-30B-A3.5B-dev-1024-wj-default", trust_remote_code=True)
+# llm = LLM(model="/code/wj-models/Nemotron-Nano-3-30B-A3.5B-dev-1024-wj-default", trust_remote_code=True, enforce_eager=True)
+# llm = LLM(model="/code/wj-models/Nemotron-Nano-3-30B-A3.5B-dev-1024", trust_remote_code=True, enforce_eager=True)
+
+llm = LLM(model="/code/wj-models/Nemotron-Nano-3-30B-A3.5B-dev-1024-fp8_pb_wo_only_moe", trust_remote_code=True, enforce_eager=True)
 
 # llm = LLM(model="/code/wj-models/Qwen3-30B-A3B-FP8", trust_remote_code=True)
 
@@ -64,15 +67,11 @@ sampling_params = SamplingParams(
 
 text = [
     "Hello, my name is",
-    "The capital of France is",
-    "The future of AI is",
+    # "The capital of France is",
+    # "The future of AI is",
 ]
 
 outputs = llm.generate(text, sampling_params)
-
-print("="*100)
-print(f"outputs: {outputs!r}")
-print("="*100)
 
 for output in outputs:
     prompt = output.prompt
