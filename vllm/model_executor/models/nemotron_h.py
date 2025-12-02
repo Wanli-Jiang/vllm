@@ -79,7 +79,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs import NemotronHConfig
 
 
-SHOW_FLAG = True
+SHOW_FLAG = False
 LAYER_IDX = 1
 
 class NemotronHMLP(nn.Module):
@@ -813,9 +813,9 @@ class NemotronHModel(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     if "in_proj.weight_scale" in name and len(loaded_weight.shape) > 1:
-                        # mamba in_proj is kept in a single weight
-                        # pass 0 to fall through the first if of weight_loader_v2
-                        weight_loader(param, loaded_weight, 0)
+                        # mamba in_proj is kept in a single weight while it should included multiple output sizes.
+                        # pass None and it will fetch weights by param output_sizes.
+                        weight_loader(param, loaded_weight, None)
 
                     else:
                         weight_loader(param, loaded_weight)

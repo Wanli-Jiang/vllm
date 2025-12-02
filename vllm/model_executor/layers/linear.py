@@ -830,6 +830,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             elif type(param) in (RowvLLMParameter, BasevLLMParameter):
                 param.load_merged_column_weight(loaded_weight=loaded_weight)
                 return
+            elif isinstance(param, BlockQuantScaleParameter):
+                # Load the whole weights by output_sizes.
+                for shard_id in range(len(self.output_sizes)):
+                    self.weight_loader_v2(param, loaded_weight, shard_id)
+                return
             # TODO: @dsikka - move to parameter.py
             self._load_fused_module_from_checkpoint(param, loaded_weight)
             return

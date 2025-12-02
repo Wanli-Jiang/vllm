@@ -52,28 +52,52 @@ The following models are in computelab cluster, see `/home/scratch.williamj_core
 # llm = LLM(model="/code/wj-models/Nemotron-Nano-3-30B-A3.5B-dev-1024-wj-default", trust_remote_code=True, enforce_eager=True)
 # llm = LLM(model="/code/wj-models/Nemotron-Nano-3-30B-A3.5B-dev-1024", trust_remote_code=True, enforce_eager=True)
 
-llm = LLM(model="/code/wj-models/Nemotron-Nano-3-30B-A3.5B-dev-1024-fp8_pb_wo_only_moe", trust_remote_code=True, enforce_eager=True)
+# llm = LLM(model="/code/wj-models/Nemotron-Nano-3-30B-A3.5B-dev-1024-fp8_pb_wo_only_moe", trust_remote_code=True, enforce_eager=True)
 
 # llm = LLM(model="/code/wj-models/Qwen3-30B-A3B-FP8", trust_remote_code=True)
 
-# llm = LLM(model="/code/wj-models/Qwen3-Next-80B-A3B-Instruct-FP8", trust_remote_code=True)
-# llm = LLM(model="/code/wj-models/DeepSeek-V3-Lite-fp8", trust_remote_code=True)
+
+"""
+For Qwen3-Next-80B-A3B-Instruct-FP8:
 
 
-sampling_params = SamplingParams(
-  max_tokens=32,
-  temperature=0.0,
-)
 
-text = [
-    "Hello, my name is",
-    # "The capital of France is",
-    # "The future of AI is",
-]
+"""
+if __name__ == '__main__':
 
-outputs = llm.generate(text, sampling_params)
 
-for output in outputs:
-    prompt = output.prompt
-    generated_text = output.outputs[0].text
-    print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+    # llm = LLM(model="/code/wj-models/nano-v3-row73-1125", trust_remote_code=True)
+    # llm = LLM(model="/code/wj-models/NVIDIA-Nemotron-Nano-3-30B-A3.5B-config5-reasoning-calib-seq-len-8K-FP8-KVFP8_HF", trust_remote_code=True)
+    # llm = LLM(model="/code/wj-models/NVIDIA-Nemotron-Nano-3-30B-A3.5B-config1-reasoning-calib-seq-len-8K-NVFP4_HF", trust_remote_code=True)
+    # llm = LLM(model="/code/wj-models/NVIDIA-Nemotron-Nano-31B-A3-v3_nvfp4", trust_remote_code=True)
+
+    llm = LLM(model="/code/wj-models/Nemotron-Nano-3-30B-A3.5B-dev-1024_fp8_pb_wo", trust_remote_code=True)
+    # llm = LLM(model="/code/wj-models/Nemotron-Nano-3-30B-A3.5B-dev-1024-wj-no-moe", trust_remote_code=True)
+    # llm = LLM(model="/code/wj-models/Nemotron-Nano-3-30B-A3.5B-dev-1024-wj-default", trust_remote_code=True, enforce_eager=True)
+    # llm = LLM(model="/code/wj-models/Nemotron-Nano-3-30B-A3.5B-dev-1024", trust_remote_code=True, enforce_eager=True)
+
+    # llm = LLM(model="/code/wj-models/Nemotron-Nano-3-30B-A3.5B-dev-1024-fp8_pb_wo_only_moe", trust_remote_code=True, enforce_eager=True)
+
+    # llm = LLM(model="/code/wj-models/Qwen3-30B-A3B-FP8", trust_remote_code=True)
+
+    # llm = LLM(model="/code/wj-models/Qwen3-Next-80B-A3B-Instruct-FP8", trust_remote_code=True, enforce_eager=True)
+    # llm = LLM(model="/code/wj-models/DeepSeek-V3-Lite-fp8", trust_remote_code=True)
+
+
+    sampling_params = SamplingParams(
+      max_tokens=32,
+      temperature=0.0,
+    )
+
+    text = [
+        "Hello, my name is",
+        "The capital of France is",
+        "The future of AI is",
+    ]
+
+    outputs = llm.generate(text, sampling_params)
+
+    for output in outputs:
+        prompt = output.prompt
+        generated_text = output.outputs[0].text
+        print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
