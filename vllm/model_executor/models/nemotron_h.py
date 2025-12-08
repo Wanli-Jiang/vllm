@@ -80,7 +80,7 @@ from vllm.transformers_utils.configs import NemotronHConfig
 
 
 SHOW_FLAG = False
-LAYER_IDX = 1
+LAYER_IDX = 0
 
 class NemotronHMLP(nn.Module):
     def __init__(
@@ -102,6 +102,7 @@ class NemotronHMLP(nn.Module):
             quant_config=quant_config,
             disable_tp=is_sequence_parallel,
             prefix=f"{prefix}.up_proj",
+            slice_padding=False,
         )
         self.down_proj = RowParallelLinear(
             input_size=intermediate_size,
@@ -111,6 +112,7 @@ class NemotronHMLP(nn.Module):
             reduce_results=reduce_results,
             disable_tp=is_sequence_parallel,
             prefix=f"{prefix}.down_proj",
+            slice_padding=False,
         )
         self.act_fn = ReLUSquaredActivation()
 
@@ -450,25 +452,27 @@ class NemotronHMambaDecoderLayer(nn.Module):
             print(f"Layer {LAYER_IDX} input: {hidden_states.shape=!r} {hidden_states.dtype=!r} {hidden_states.device=!r} {hidden_states=!r}")
             print("="*100)
 
-        if show:
-            print("="*100)
-            # Print all parameter weights for self.mixer
-            print(f"Layer {LAYER_IDX} mixer parameter weights:")
-            in_proj_weight, in_proj_weight_scale = None, None
-            for name, param in self.mixer.named_parameters():
-                print(f"  {name}: {param.shape} dtype={param.dtype} device={param.device} values: {param.data}")
+        # if show:
+        #     print("="*100)
+        #     # Print all parameter weights for self.mixer
+        #     print(f"Layer {LAYER_IDX} mixer parameter weights:")
+        #     in_proj_weight, in_proj_weight_scale = None, None
+        #     for name, param in self.mixer.named_parameters():
+        #         print(f"  {name}: {param.shape} dtype={param.dtype} device={param.device} values: {param.data}")
 
-                if name == "in_proj.weight":
-                    in_proj_weight = param
-                elif name == "in_proj.weight_scale":
-                    in_proj_weight_scale = param
+        #         if name == "in_proj.weight":
+        #             in_proj_weight = param
+        #         elif name == "in_proj.weight_scale":
+        #             in_proj_weight_scale = param
 
-            if in_proj_weight is not None and in_proj_weight_scale is not None:
-                in_proj_weight_dq = dequantize_fp8_pb_wo_to_bf16(in_proj_weight, in_proj_weight_scale)
-                print(f"Layer {LAYER_IDX} in_proj_dequantized: {in_proj_weight_dq.shape=!r} {in_proj_weight_dq.dtype=!r} {in_proj_weight_dq.device=!r} {in_proj_weight_dq=!r}")
-            print("="*100)
+        #     if in_proj_weight is not None and in_proj_weight_scale is not None:
+        #         in_proj_weight_dq = dequantize_fp8_pb_wo_to_bf16(in_proj_weight, in_proj_weight_scale)
+        #         print(f"Layer {LAYER_IDX} in_proj_dequantized: {in_proj_weight_dq.shape=!r} {in_proj_weight_dq.dtype=!r} {in_proj_weight_dq.device=!r} {in_proj_weight_dq=!r}")
+        #     print("="*100)
 
-        output = self.mixer(hidden_states)
+        output = self.mixer(hidden_states, show=show)
+
+        # raise InterruptedError(f"Stop here {LAYER_IDX=!r} {show=!r}")
 
         if show:
             print("="*100)
@@ -645,11 +649,12 @@ class NemotronHModel(nn.Module):
 
         self.norm_f = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
-        print("="*100)
-        print(f"{self.start_layer=!r}")
-        print(f"{self.end_layer=!r}")
-        print(f"{self.layers=!r}")
-        print("="*100)
+        if SHOW_FLAG:
+            print("="*100)
+            print(f"{self.start_layer=!r}")
+            print(f"{self.end_layer=!r}")
+            print(f"{self.layers=!r}")
+            print("="*100)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -674,8 +679,16 @@ class NemotronHModel(nn.Module):
 
         for layer_idx, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer)):
 
-            show = layer_idx == LAYER_IDX and SHOW_FLAG and hidden_states.shape[0] == 6
 
+            # if layer_idx == LAYER_IDX:
+            #     print("="*100)
+            #     print(f"layer_idx: {layer_idx=!r} {LAYER_IDX=!r} {SHOW_FLAG=!r} {hidden_states.shape=!r}")
+            #     print("="*100)
+            show = layer_idx == LAYER_IDX and SHOW_FLAG and hidden_states.shape[0] == 5
+
+            # print("="*100)
+            # print(f"Layer {layer_idx} input: {hidden_states.shape=!r}")
+            # print("="*100)
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -757,6 +770,11 @@ class NemotronHModel(nn.Module):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+
+                # print("="*100)
+                # print(f" PASS loaded weight: {name=!r} {loaded_weight.shape=!r} {param.shape=!r} {weight_loader=!r}")
+                # print("="*100)
+
                 break
 
             # load other params
@@ -798,6 +816,9 @@ class NemotronHModel(nn.Module):
                         expert_id=expert_id,
                         return_success=True,
                     )
+                    # print("="*100)
+                    # print(f" PASS loaded weight: {name=!r} {loaded_weight.shape=!r} {param.shape=!r} {weight_loader=!r}")
+                    # print("="*100)
                     if success:
                         name = name_mapped
                         break
@@ -817,8 +838,14 @@ class NemotronHModel(nn.Module):
                         # pass None and it will fetch weights by param output_sizes.
                         weight_loader(param, loaded_weight, None)
 
+                        # print("="*100)
+                        # print(f" PASS loaded weight: {name=!r} {loaded_weight.shape=!r} {param.shape=!r} {weight_loader=!r}")
+                        # print("="*100)
                     else:
                         weight_loader(param, loaded_weight)
+                        # print("="*100)
+                        # print(f" PASS loaded weight: {name=!r} {loaded_weight.shape=!r} {param.shape=!r} {weight_loader=!r}")
+                        # print("="*100)
 
             loaded_params.add(name)
         return loaded_params

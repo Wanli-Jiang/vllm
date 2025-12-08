@@ -451,6 +451,7 @@ class ColumnParallelLinear(LinearBase):
         *,
         return_bias: bool = True,
         disable_tp: bool = False,
+        slice_padding: bool = True,
     ):
         # Divide the weight matrix along the last dimension.
         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
@@ -463,6 +464,8 @@ class ColumnParallelLinear(LinearBase):
             self.output_partition_sizes = [
                 divide(output_size, self.tp_size) for output_size in self.output_sizes
             ]
+        self.original_output_size_per_partition = sum(self.output_partition_sizes)
+        self.slice_padding = slice_padding
 
         super().__init__(
             input_size,
@@ -552,6 +555,47 @@ class ColumnParallelLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
+
+        if isinstance(param, BlockQuantScaleParameter):
+            assert self.quant_method is not None
+            # Assume the weight block size has been set by quant method
+            assert hasattr(self, "weight_block_size")
+            weight_block_size = self.weight_block_size
+            assert weight_block_size is not None
+            block_n, block_m = weight_block_size[0], weight_block_size[1]
+
+            shard_dim = getattr(param, "output_dim", None)
+            assert shard_dim is not None
+
+            src_size = loaded_weight.shape[shard_dim]
+            dst_size = param.shape[shard_dim] * self.tp_size
+
+            if self.tp_rank == self.tp_size - 1 and dst_size != src_size:
+                loaded_weight = torch.nn.functional.pad(loaded_weight, (0, 0, 0, 0, 0, 0, 0, dst_size - src_size), value=0)
+
+        extra_kwargs = getattr(param, "extra_kwargs", None)
+        if extra_kwargs is not None:
+            original_output_size_per_partition = extra_kwargs.get("original_output_size_per_partition", None)
+            original_input_size_per_partition = extra_kwargs.get("original_input_size_per_partition", None)
+            if original_output_size_per_partition is not None and original_input_size_per_partition is not None:
+                if original_output_size_per_partition != loaded_weight.shape[0]:
+                    # Padding output size.
+                    src_size = loaded_weight.shape[0]
+                    dst_size = param.shape[0] * self.tp_size
+                    if self.tp_rank == self.tp_size - 1 and dst_size != src_size:
+                        loaded_weight = torch.nn.functional.pad(loaded_weight, (0, 0, 0, dst_size - src_size), value=0)
+                if original_input_size_per_partition != loaded_weight.shape[1]:
+                    # Padding input size.
+                    src_size = loaded_weight.shape[1]
+                    dst_size = param.shape[1] * self.tp_size
+                    if self.tp_rank == self.tp_size - 1 and dst_size != src_size:
+                        loaded_weight = torch.nn.functional.pad(loaded_weight, (0, dst_size - src_size, 0, 0), value=0)
+
+        # if self.tp_rank == 1 and not isinstance(param, BlockQuantScaleParameter):
+        #     print("="*100)
+        #     print(f"{loaded_weight.shape=!r} {param.shape=!r} {getattr(param, "input_dim", None)=!r} {self.tp_rank=!r} {self.tp_size=!r}")
+        #     print("="*100)
+
         param.load_column_parallel_weight(loaded_weight=loaded_weight)
 
     def forward(
@@ -563,6 +607,12 @@ class ColumnParallelLinear(LinearBase):
         # Matrix multiply.
         assert self.quant_method is not None
         output_parallel = self.quant_method.apply(self, input_, bias)
+
+        if self.slice_padding:
+            output_parallel = output_parallel[:, :self.original_output_size_per_partition]
+        # print("="*100)
+        # print(f"{output_parallel.shape=!r} {input_.shape=!r} {bias=!r} {self.original_output_size_per_partition=!r} {self.weight.shape=!r}")
+        # print("="*100)
 
         if self.gather_output and self.tp_size > 1:
             # All-gather across the partitions.
@@ -622,6 +672,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         *,
         return_bias: bool = True,
         disable_tp: bool = False,
+        slice_padding: bool = True,
     ):
         self.output_sizes = output_sizes
         self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
@@ -639,7 +690,23 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             prefix=prefix,
             return_bias=return_bias,
             disable_tp=disable_tp,
+            slice_padding=slice_padding,
         )
+        # # Hack for block-scale fp8.
+        # self.original_output_sizes = self.output_sizes
+        # self.original_output_size = sum(self.output_sizes)
+
+        # self.block_n = quant_config.block_size[0]
+        # self._sharded_output_sizes = [
+        #     output_size // self.tp_size
+        #     for output_size in self.output_sizes
+        # ]
+        # self._sharded_output_scale_sizes = [
+        #     (output_size + self.block_n - 1) // self.block_n
+        #     for output_size in self._sharded_output_sizes
+        # ]
+        # self._sharded_output
+
 
     def weight_loader(
         self,
@@ -793,10 +860,20 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         An example of a model with these fused layers:
         https://huggingface.co/microsoft/Phi-3-mini-4k-instruct
         """
+        if isinstance(param, BlockQuantScaleParameter):
+            assert self.quant_method is not None
+            # Assume the weight block size has been set by quant method
+            assert hasattr(self, "weight_block_size")
+            weight_block_size = self.weight_block_size
+            assert weight_block_size is not None
+            block_n, _ = weight_block_size[0], weight_block_size[1]
+        else:
+            block_n = 1
 
         current_shard_offset = 0
         shard_offsets: list[tuple[int, int, int]] = []
         for i, output_size in enumerate(self.output_sizes):
+            output_size = (output_size + block_n - 1) // block_n
             shard_offsets.append((i, current_shard_offset, output_size))
             current_shard_offset += output_size
 
@@ -830,11 +907,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             elif type(param) in (RowvLLMParameter, BasevLLMParameter):
                 param.load_merged_column_weight(loaded_weight=loaded_weight)
                 return
-            elif isinstance(param, BlockQuantScaleParameter):
-                # Load the whole weights by output_sizes.
-                for shard_id in range(len(self.output_sizes)):
-                    self.weight_loader_v2(param, loaded_weight, shard_id)
-                return
+            # elif isinstance(param, BlockQuantScaleParameter):
+            #     # Load the whole weights by output_sizes.
+            #     for shard_id in range(len(self.output_sizes)):
+            #         self.weight_loader_v2(param, loaded_weight, shard_id)
+            #     return
             # TODO: @dsikka - move to parameter.py
             self._load_fused_module_from_checkpoint(param, loaded_weight)
             return
@@ -848,14 +925,33 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             weight_block_size = self.weight_block_size
             assert weight_block_size is not None
             block_n, _ = weight_block_size[0], weight_block_size[1]
-            shard_offset = (
+            unshard_offset = (
                 (sum(self.output_sizes[:loaded_shard_id]) + block_n - 1) // block_n
-            ) // self.tp_size
-            shard_size = (
+            )
+            unshard_size = (
                 (self.output_sizes[loaded_shard_id] + block_n - 1)
                 // block_n
-                // self.tp_size
             )
+            shard_offset = unshard_offset // self.tp_size
+            shard_size = (unshard_size + self.tp_size - 1) // self.tp_size
+
+            # print("="*100)
+            # print("!!! shard_offset", shard_offset)
+            # print("!!! shard_size", shard_size)
+            # print("!!! loaded_weight", loaded_weight.shape)
+            # print("!!! param", param.shape)
+            # print("!!! loaded_shard_id", loaded_shard_id)
+            # print("="*100)
+
+            if shard_size * self.tp_size != unshard_size:
+                # Pad last for correct block-scal fp8.
+                # Why we need it?
+                # The weights will be splitted into tp_size parts, so that for each part, we need to set the correct block-scale fp8 weights.
+                unshard_weight_scales_size = loaded_weight.shape[1]
+                required_padding = shard_size * self.tp_size - unshard_weight_scales_size
+                if required_padding > 0:
+                    loaded_weight = loaded_weight.expand(shard_size * self.tp_size, -1, -1, -1)
+
         else:
             shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
             shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
@@ -911,6 +1007,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         *,
         return_bias: bool = True,
         disable_tp: bool = False,
+        slice_padding: bool = True,
     ):
         self.hidden_size = hidden_size
         self.head_size = head_size
@@ -948,6 +1045,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             prefix=prefix,
             return_bias=return_bias,
             disable_tp=disable_tp,
+            slice_padding=slice_padding,
         )
 
     def _get_shard_offset_mapping(self, loaded_shard_id: str):
@@ -1291,6 +1389,7 @@ class RowParallelLinear(LinearBase):
         *,
         return_bias: bool = True,
         disable_tp: bool = False,
+        slice_padding: bool = True,
     ):
         # Divide the weight matrix along the first dimension.
         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
@@ -1298,6 +1397,8 @@ class RowParallelLinear(LinearBase):
         self.input_size_per_partition = divide(input_size, self.tp_size)
         self.output_size_per_partition = output_size
         self.output_partition_sizes = [output_size]
+        self.original_output_size_per_partition = output_size
+        self.slice_padding = slice_padding
 
         super().__init__(
             input_size,
@@ -1388,6 +1489,47 @@ class RowParallelLinear(LinearBase):
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
 
+
+        if isinstance(param, BlockQuantScaleParameter):
+            assert self.quant_method is not None
+            # Assume the weight block size has been set by quant method
+            assert hasattr(self, "weight_block_size")
+            weight_block_size = self.weight_block_size
+            assert weight_block_size is not None
+            block_n, block_m = weight_block_size[0], weight_block_size[1]
+
+            input_dim = getattr(param, "input_dim", None)
+            assert input_dim is not None
+
+            src_size = loaded_weight.shape[input_dim]
+            dst_size = param.shape[input_dim] * self.tp_size
+
+            if self.tp_rank == self.tp_size - 1 and dst_size != src_size:
+                loaded_weight = torch.nn.functional.pad(loaded_weight, (0, 0, 0, dst_size - src_size), value=0)
+
+
+        extra_kwargs = getattr(param, "extra_kwargs", None)
+        if extra_kwargs is not None:
+            original_output_size_per_partition = extra_kwargs.get("original_output_size_per_partition", None)
+            original_input_size_per_partition = extra_kwargs.get("original_input_size_per_partition", None)
+            if original_output_size_per_partition is not None and original_input_size_per_partition is not None:
+                if original_output_size_per_partition != loaded_weight.shape[0]:
+                    # Padding output size.
+                    src_size = loaded_weight.shape[0]
+                    dst_size = param.shape[0] * self.tp_size
+                    if self.tp_rank == self.tp_size - 1 and dst_size != src_size:
+                        loaded_weight = torch.nn.functional.pad(loaded_weight, (0, 0, 0, dst_size - src_size), value=0)
+                if original_input_size_per_partition != loaded_weight.shape[1]:
+                    # Padding input size.
+                    src_size = loaded_weight.shape[1]
+                    dst_size = param.shape[1] * self.tp_size
+                    if self.tp_rank == self.tp_size - 1 and dst_size != src_size:
+                        loaded_weight = torch.nn.functional.pad(loaded_weight, (0, dst_size - src_size, 0, 0), value=0)
+
+        # if self.tp_rank == 1 and not isinstance(param, BlockQuantScaleParameter):
+        #     print("="*100)
+        #     print(f"{loaded_weight.shape=!r} {param.shape=!r} {getattr(param, "input_dim", None)=!r} {self.tp_rank=!r} {self.tp_size=!r}")
+        #     print("="*100)
         param.load_row_parallel_weight(loaded_weight=loaded_weight)
 
     def forward(

@@ -507,9 +507,30 @@ class MambaMixer2(MambaBase, CustomOp):
         self,
         hidden_states: torch.Tensor,
         mup_vector: torch.Tensor | None = None,
+        **kwargs,
     ):
+        show = kwargs["show"]
+
+        if show:
+            print("="*100)
+            print(f"MambaMixer2 input: {hidden_states.shape=!r} {hidden_states.dtype=!r} {hidden_states.device=!r} {hidden_states=!r}")
+            print(f"MambaMixer2 self.in_proj: {self.in_proj=!r}")
+            print(f"MambaMixer2 self.in_proj: {self.in_proj.weight.shape=!r} {self.in_proj.weight.dtype=!r} {self.in_proj.weight.device=!r} {self.in_proj.weight=!r}")
+            print(f"MambaMixer2 self.in_proj: {self.in_proj.weight_scale.shape=!r} {self.in_proj.weight_scale.dtype=!r} {self.in_proj.weight_scale.device=!r} {self.in_proj.weight_scale=!r}")
+            # print(f"MambaMixer2 self.out_proj: {self.out_proj=!r}")
+            # print(f"MambaMixer2 self.norm: {self.norm=!r}")
+            # print(f"MambaMixer2 self.conv1d: {self.conv1d=!r}")
+            print("="*100)
+
         # 1. Gated MLP's linear projection
         projected_states, _ = self.in_proj(hidden_states)
+
+
+        if show:
+            print("="*100)
+            print(f"MambaMixer2 projected_states: {projected_states.shape=!r} {projected_states.dtype=!r} {projected_states.device=!r} {projected_states=!r}")
+            print("="*100)
+
         if mup_vector is not None:
             projected_states = projected_states * mup_vector
 

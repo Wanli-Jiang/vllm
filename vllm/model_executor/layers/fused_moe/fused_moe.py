@@ -1718,6 +1718,11 @@ def fused_experts_impl(
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
+
+    # print("="*100)
+    # print(f"{hidden_states.shape=!r} {w1.shape=!r} {w2.shape=!r} {topk_weights.shape=!r} {topk_ids.shape=!r}")
+    # print("="*100)
+
     # Check constraints.
     if use_int4_w4a16:
         assert hidden_states.size(1) // 2 == w1.size(2), "Hidden size mismatch"

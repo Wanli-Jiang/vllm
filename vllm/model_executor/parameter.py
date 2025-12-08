@@ -168,6 +168,11 @@ class _ColumnvLLMParameter(BasevLLMParameter):
 
         param_data = self.data
 
+        # if self.tp_rank == 1:
+        #     print("-"*50)
+        #     print(f" meta: {self.output_dim=!r} {param_data.shape=!r} {loaded_weight.shape=!r} param slice: {shard_offset=!r} {shard_size=!r} load_weight slice {self.tp_rank * shard_size=!r} {shard_size=!r}")
+        #     print("-"*50)
+
         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
         loaded_weight = loaded_weight.narrow(
             self.output_dim, self.tp_rank * shard_size, shard_size
@@ -211,6 +216,7 @@ class RowvLLMParameter(BasevLLMParameter):
 
     def __init__(self, input_dim: int, **kwargs):
         self._input_dim = input_dim
+        self.kwargs = kwargs
         super().__init__(**kwargs)
 
     @property
@@ -226,7 +232,7 @@ class RowvLLMParameter(BasevLLMParameter):
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
-        assert self.data.shape == loaded_weight.shape
+        assert self.data.shape == loaded_weight.shape, f"{self.data.shape=!r} {loaded_weight.shape=!r} {self.input_dim=!r}"
         self.data.copy_(loaded_weight)
 
 
@@ -236,7 +242,9 @@ class ModelWeightParameter(_ColumnvLLMParameter, RowvLLMParameter):
     row parallelism.
     """
 
-    pass
+    def __init__(self, **kwargs):
+        self.extra_kwargs = kwargs.pop("extra_kwargs", None)
+        super().__init__(**kwargs)
 
 
 class GroupQuantScaleParameter(_ColumnvLLMParameter, RowvLLMParameter):

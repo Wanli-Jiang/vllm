@@ -12,6 +12,7 @@ from torch.nn.parameter import Parameter
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm._custom_ops import cutlass_scaled_fp4_mm, scaled_fp4_quant
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
@@ -423,18 +424,103 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         layer.logical_widths = output_partition_sizes
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
+        original_output_size_per_partition = output_size_per_partition
+        original_input_size_per_partition = input_size_per_partition
+
+        tp_size = get_tensor_model_parallel_world_size()
+        if layer.tp_size != tp_size:
+            logger.warning("TP size in ModelOptFp8LinearMethod is not the same as the global TP size, using layer.tp_size to set up weight shape.")
+            tp_size = layer.tp_size
+
+        block_scale_fp8_flag = False
+        if self.quant_config.is_checkpoint_fp8_serialized:
+            if self.quant_config.is_block_quant:
+                block_scale_fp8_flag = True
+
+        # Prepare weight_scale and weight_shape.
+        if block_scale_fp8_flag:
+            # Check which dim is sharded by tp.
+            input_size = layer.input_size
+            output_size = layer.output_size
+            input_size_per_partition = layer.input_size_per_partition
+            output_size_per_partition = layer.output_size_per_partition
+
+            shard_status = None
+            if input_size != input_size_per_partition:
+                assert output_size == output_size_per_partition
+                assert input_size == input_size_per_partition * tp_size
+                shard_status = "input"
+            elif output_size != output_size_per_partition:
+                assert input_size == input_size_per_partition
+                assert output_size == output_size_per_partition * tp_size
+                shard_status = "output"
+            elif input_size == input_size_per_partition and output_size == output_size_per_partition:
+                shard_status = None
+            else:
+                raise ValueError(f"Invalid shard status: both input and output are sharded. \n {input_size=!r} {output_size=!r} {input_size_per_partition=!r} {output_size_per_partition=!r} {tp_size=!r}")
+
+            block_n, block_k = self.quant_config.block_size
+            # weight scale shape per rank (aligned with block size)
+            aligned_weight_scale_shape = (
+                (output_size_per_partition + block_n - 1) // block_n,
+                (input_size_per_partition + block_k - 1) // block_k,
+            )
+            aligned_weight_shape = (
+                aligned_weight_scale_shape[0] * block_n,
+                aligned_weight_scale_shape[1] * block_k,
+            )
+
+
+            # # weight scale shape per rank (aligned with tp size)
+            # if shard_status == "output":
+            #     weight_scale_shape = (
+            #         (unaligned_weight_scale_shape[0] + tp_size - 1) // tp_size * tp_size,
+            #         unaligned_weight_scale_shape[1],
+            #     )
+            # elif shard_status == "input":
+            #     weight_scale_shape = (
+            #         unaligned_weight_scale_shape[0],
+            #         (unaligned_weight_scale_shape[1] + tp_size - 1) // tp_size * tp_size,
+            #     )
+            # elif shard_status is None:
+            #     weight_scale_shape = unaligned_weight_scale_shape
+            # else:
+            #     raise ValueError(f"Invalid shard status: {shard_status}")
+
+            # weight_shape = (
+            #     weight_scale_shape[0] * block_n,
+            #     weight_scale_shape[1] * block_k,
+            # )
+
+            _output_partition_size = output_size_per_partition
+            _input_size_per_partition = input_size_per_partition
+
+            output_size_per_partition = aligned_weight_shape[0]
+            input_size_per_partition = aligned_weight_shape[1]
+
+            layer.input_size_per_partition = input_size_per_partition
+            layer.output_size_per_partition = output_size_per_partition
+
+            # print("="*100)
+            # print(f"{layer.input_size=!r} {layer.output_size=!r} {output_size_per_partition=!r} {_output_partition_size=!r}  {input_size_per_partition=!r}  {_input_size_per_partition=!r}")
+            # print("="*100)
+
         weight_dtype = (
             torch.float8_e4m3fn
             if self.quant_config.is_checkpoint_fp8_serialized
             else params_dtype
         )
         weight = ModelWeightParameter(
-            data=torch.empty(
+            data=torch.zeros(
                 output_size_per_partition, input_size_per_partition, dtype=weight_dtype
             ),
             input_dim=1,
             output_dim=0,
             weight_loader=weight_loader,
+            extra_kwargs={
+                "original_output_size_per_partition": original_output_size_per_partition,
+                "original_input_size_per_partition": original_input_size_per_partition,
+            },
         )
         layer.register_parameter("weight", weight)
 
@@ -445,14 +531,14 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 layer.weight_block_size = self.quant_config.block_size
                 block_n, block_k = self.quant_config.block_size
                 weight_scale = BlockQuantScaleParameter(
-                    data=torch.empty(
+                    data=torch.zeros(
                         (output_size_per_partition + block_n - 1) // block_n,
                         1,
                         (input_size_per_partition + block_k - 1) // block_k,
                         1,
                         dtype=torch.float32,
                     ),
-                    input_dim=1,
+                    input_dim=2,
                     output_dim=0,
                     weight_loader=weight_loader,
                 )
@@ -505,13 +591,19 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.quant_config.is_block_quant:
-            return self.w8a8_block_fp8_linear.apply(
-                input=x,
-                weight=layer.weight,
-                weight_scale=layer.weight_scale,
-                input_scale=layer.input_scale,
-                bias=bias,
-            )
+            try:
+                return self.w8a8_block_fp8_linear.apply(
+                    input=x,
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale,
+                    input_scale=layer.input_scale,
+                    bias=bias,
+                )
+            except Exception as e:
+                print("="*100)
+                print(f"{layer.weight.shape=!r} {layer.weight_scale.shape=!r} {layer.input_scale=!r} {x.shape=!r}")
+                print("="*100)
+                raise e
 
         else:
             return self.fp8_linear.apply(
@@ -634,6 +726,14 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         else:
             w13_up_dim = intermediate_size_per_partition
 
+
+        # print("="*100)
+        # print(f"{layer=!r}")
+        # print(f"{num_experts=!r} {w13_up_dim=!r} {hidden_size=!r} {intermediate_size_per_partition=!r}")
+        # print("="*100)
+        # raise ValueError("Stop here")
+
+
         w13_weight = ModelWeightParameter(
             data=torch.empty(
                 num_experts,
@@ -677,8 +777,8 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                         1,
                         dtype=torch.float32,
                     ),
-                    input_dim=1,
-                    output_dim=0,
+                    input_dim=3,
+                    output_dim=1,
                     weight_loader=weight_loader,
                 )
                 layer.register_parameter("w13_weight_scale", w13_weight_scale)
@@ -691,8 +791,8 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                         1,
                         dtype=torch.float32,
                     ),
-                    input_dim=1,
-                    output_dim=0,
+                    input_dim=3,
+                    output_dim=1,
                     weight_loader=weight_loader,
                 )
                 layer.register_parameter("w2_weight_scale", w2_weight_scale)
@@ -748,6 +848,10 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             self._process_weights_after_loading_blockscale(layer)
         else:
             self._process_weights_after_loading_per_tensor(layer)
+        # print("="*100)
+        # print(f"{layer.w13_weight.shape=!r} {layer.w2_weight.shape=!r} {layer.w13_weight_scale.shape=!r} {layer.w2_weight_scale.shape=!r}")
+        # print("="*100)
+
 
     def _process_weights_after_loading_blockscale(self, layer: torch.nn.Module) -> None:
         w13_weight = layer.w13_weight
@@ -765,7 +869,8 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         )
 
         # Apply padding if needed
-        required_padding = w13_weight.size(-2) % block_shape[0]
+        required_padding = layer.w13_weight_scale.size(-2) * block_shape[0] - w13_weight.size(-2)
+        # required_padding = w13_weight.size(-2) % block_shape[0]
         if required_padding != 0:
             layer.w13_weight = Parameter(
                 torch.nn.functional.pad(w13_weight, (0, 0, 0, required_padding)),

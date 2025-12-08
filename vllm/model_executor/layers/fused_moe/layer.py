@@ -525,6 +525,7 @@ class FusedMoE(CustomOp):
 
         assert intermediate_size % self.tp_size == 0
         self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
         self.reduce_results = reduce_results
         self.renormalize = renormalize
@@ -1238,16 +1239,47 @@ class FusedMoE(CustomOp):
             # This is checked by comparing the hidden_out dims of the
             # loaded_weight and the param.
             if "w13_weight_scale" in weight_name:
-                loaded_weight_hidden_out = loaded_weight.shape[-2]
-                param_hidden_out = param.data.shape[-2] * self.tp_size
-                if loaded_weight_hidden_out == param_hidden_out:
-                    self._load_combined_w13_weight_scale(
-                        shard_dim=shard_dim,
-                        loaded_weight=loaded_weight,
-                        param=expert_data,
-                        tp_rank=self.tp_rank,
-                    )
-                    return True if return_success else None
+                assert shard_dim == 0
+                block_n, block_k = self.quant_method.quant_config.block_size
+                basic_shard_size = (self.intermediate_size_per_partition + block_n - 1) // block_n
+                shard_offset = basic_shard_size * self.tp_rank
+                dst_size = basic_shard_size * self.tp_size
+
+                if self.tp_rank == self.tp_size - 1 and dst_size != loaded_weight.shape[shard_dim]:
+                    loaded_weight = torch.nn.functional.pad(loaded_weight, (0, 0, 0, 0, 0, 0, 0, dst_size - loaded_weight.shape[shard_dim]), value=0)
+
+                # if self.tp_rank == 1:
+                #     print("="*100)
+                #     print(f"{loaded_weight.shape=!r} {expert_data.shape=!r} {self.tp_rank=!r} {self.tp_size=!r} {shard_dim=!r}")
+                #     print("="*100)
+                # loaded_weight_hidden_out = loaded_weight.shape[-2]
+                # param_hidden_out = param.data.shape[-2] * self.tp_size
+                # assert loaded_weight_hidden_out == param_hidden_out, f"{loaded_weight_hidden_out=!r} {param_hidden_out=!r}"
+                self._load_combined_w13_weight_scale(
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    param=expert_data,
+                    tp_rank=self.tp_rank,
+                )
+                return True if return_success else None
+
+            if "w2_weight_scale" in weight_name:
+                shard_dim = 2
+                block_n, block_k = self.quant_method.quant_config.block_size
+                basic_shard_size = (self.intermediate_size_per_partition + block_n - 1) // block_n
+                shard_offset = basic_shard_size * self.tp_rank
+                dst_size = basic_shard_size * self.tp_size
+
+                if self.tp_rank == self.tp_size - 1 and dst_size != loaded_weight.shape[shard_dim]:
+                    loaded_weight = torch.nn.functional.pad(loaded_weight, (0, 0, 0, dst_size - loaded_weight.shape[shard_dim]), value=0)
+                loaded_weight = loaded_weight.narrow(shard_dim, shard_offset, basic_shard_size)
+                # if self.tp_rank == 1:
+                #     print("="*100)
+                #     print(f"{shard_offset=!r} {basic_shard_size=!r} {shard_dim=!r} {loaded_weight.shape=!r} {expert_data.shape=!r}")
+                #     print("="*100)
+
+                expert_data.copy_(loaded_weight)
+                return True if return_success else None
 
             # For other weights, call _load_model_weight_or_group_weight_scale()
             # to load it.
