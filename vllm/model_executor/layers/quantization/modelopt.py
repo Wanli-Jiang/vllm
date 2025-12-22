@@ -12,6 +12,7 @@ from torch.nn.parameter import Parameter
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm._custom_ops import cutlass_scaled_fp4_mm, scaled_fp4_quant
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
@@ -53,6 +54,9 @@ from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     select_cutlass_fp8_gemm_impl,
     swap_w13_to_w31,
 )
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    W8A8BlockFp8LinearOp,
+)
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
     apply_fp4_marlin_linear,
     is_fp4_marlin_supported,
@@ -67,9 +71,14 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     Fp8LinearOp,
+    cutlass_block_fp8_supported,
     requantize_with_max_scale,
 )
-from vllm.model_executor.parameter import ModelWeightParameter, PerTensorScaleParameter
+from vllm.model_executor.parameter import (
+    BlockQuantScaleParameter,
+    ModelWeightParameter,
+    PerTensorScaleParameter,
+)
 from vllm.scalar_type import scalar_types
 from vllm.utils.flashinfer import (
     flashinfer_scaled_fp4_mm,
@@ -82,7 +91,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-QUANT_ALGOS = ["FP8", "NVFP4"]
+QUANT_ALGOS = ["FP8", "NVFP4", "fp8_pb_wo"]
 KV_CACHE_QUANT_ALGOS = ["FP8"]
 
 
@@ -106,6 +115,10 @@ class ModelOptQuantConfigBase(QuantizationConfig):
     ):
         super().__init__()
         self.exclude_modules: list[str] = exclude_modules
+
+    @property
+    def is_block_quant(self) -> bool:
+        raise NotImplementedError
 
     def is_layer_excluded(self, prefix: str) -> bool:
         """
@@ -275,11 +288,13 @@ class ModelOptFp8Config(ModelOptQuantConfigBase):
 
     def __init__(
         self,
+        quant_method: str,
         is_checkpoint_fp8_serialized: bool,
         kv_cache_quant_method: str | None,
         exclude_modules: list[str],
     ) -> None:
         super().__init__(exclude_modules)
+        self.quant_method = quant_method
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         self.kv_cache_quant_method = kv_cache_quant_method
         if is_checkpoint_fp8_serialized:
@@ -297,6 +312,16 @@ class ModelOptFp8Config(ModelOptQuantConfigBase):
     @classmethod
     def get_min_capability(cls) -> int:
         return 89
+
+    @property
+    def is_block_quant(self) -> bool:
+        return self.quant_method == "fp8_pb_wo"
+
+    @property
+    def block_size(self) -> tuple[int, int] | None:
+        if self.quant_method == "fp8_pb_wo":
+            return (128, 128)
+        return None
 
     @classmethod
     def override_quantization_method(
@@ -340,9 +365,14 @@ class ModelOptFp8Config(ModelOptQuantConfigBase):
         original_config: dict[str, Any],
         **kwargs: Any,
     ) -> "ModelOptFp8Config":
-        is_checkpoint_fp8_serialized = "FP8" in quant_method
+        is_checkpoint_fp8_serialized = "FP8" in quant_method.upper()
 
-        return cls(is_checkpoint_fp8_serialized, kv_cache_quant_method, exclude_modules)
+        return cls(
+            quant_method,
+            is_checkpoint_fp8_serialized,
+            kv_cache_quant_method,
+            exclude_modules,
+        )
 
 
 class ModelOptFp8LinearMethod(LinearMethodBase):
@@ -359,9 +389,20 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: ModelOptFp8Config) -> None:
         self.quant_config = quant_config
-        self.fp8_linear = Fp8LinearOp(
-            act_quant_static=True, act_quant_group_shape=GroupShape.PER_TENSOR
-        )
+        if self.quant_config.is_block_quant:
+            assert self.quant_config.block_size is not None
+            self.w8a8_block_fp8_linear = W8A8BlockFp8LinearOp(
+                weight_group_shape=GroupShape(*self.quant_config.block_size),
+                act_quant_group_shape=GroupShape(1, self.quant_config.block_size[0]),
+                cutlass_block_fp8_supported=cutlass_block_fp8_supported(),
+                use_aiter_and_is_supported=False,
+            )
+        else:
+            self.fp8_linear = Fp8LinearOp(
+                act_quant_static=True, act_quant_group_shape=GroupShape.PER_TENSOR
+            )
+        self.slice_outputs_padding = False
+        self.original_output_size_per_partition = None
 
     def create_weights(
         self,
@@ -376,16 +417,57 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         del input_size, output_size
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
+        self.slice_outputs_padding = extra_weight_attrs.get(
+            "slice_outputs_padding", self.slice_outputs_padding
+        )
         layer.logical_widths = output_partition_sizes
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
+
+        tp_size = get_tensor_model_parallel_world_size()
+        if layer.tp_size != tp_size:
+            logger.warning(
+                "TP size in ModelOptFp8LinearMethod is not the same as the global TP size, using layer.tp_size to set up weight shape."
+            )
+            tp_size = layer.tp_size
+
+        block_scale_fp8_flag = False
+        if self.quant_config.is_checkpoint_fp8_serialized:
+            if self.quant_config.is_block_quant:
+                block_scale_fp8_flag = True
+
+        # Prepare weight_scale and weight_shape.
+        if block_scale_fp8_flag:
+            # Check which dim is sharded by tp.
+            input_size = layer.input_size
+            output_size = layer.output_size
+            input_size_per_partition = layer.input_size_per_partition
+            output_size_per_partition = layer.output_size_per_partition
+            self.original_output_size_per_partition = output_size_per_partition
+            block_n, block_k = self.quant_config.block_size
+            # weight scale shape per rank (aligned with block size)
+            aligned_weight_scale_shape = (
+                (output_size_per_partition + block_n - 1) // block_n,
+                (input_size_per_partition + block_k - 1) // block_k,
+            )
+            aligned_weight_shape = (
+                aligned_weight_scale_shape[0] * block_n,
+                aligned_weight_scale_shape[1] * block_k,
+            )
+            _output_partition_size = output_size_per_partition
+            _input_size_per_partition = input_size_per_partition
+            output_size_per_partition = aligned_weight_shape[0]
+            input_size_per_partition = aligned_weight_shape[1]
+            layer.input_size_per_partition = input_size_per_partition
+            layer.output_size_per_partition = output_size_per_partition
+
         weight_dtype = (
             torch.float8_e4m3fn
             if self.quant_config.is_checkpoint_fp8_serialized
             else params_dtype
         )
         weight = ModelWeightParameter(
-            data=torch.empty(
+            data=torch.zeros(
                 output_size_per_partition, input_size_per_partition, dtype=weight_dtype
             ),
             input_dim=1,
@@ -395,32 +477,58 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         layer.register_parameter("weight", weight)
 
         if self.quant_config.is_checkpoint_fp8_serialized:
-            # WEIGHT SCALE
-            weight_scale = PerTensorScaleParameter(
-                data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-                weight_loader=weight_loader,
-            )
-            weight_scale[:] = torch.finfo(torch.float32).min
-            layer.register_parameter("weight_scale", weight_scale)
-            # INPUT SCALE
-            scale = PerTensorScaleParameter(
-                data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-                weight_loader=weight_loader,
-            )
+            if self.quant_config.is_block_quant:
+                # BLOCK SCALE
+                assert self.quant_config.block_size is not None
+                layer.weight_block_size = self.quant_config.block_size
+                block_n, block_k = self.quant_config.block_size
+                weight_scale = BlockQuantScaleParameter(
+                    data=torch.zeros(
+                        (output_size_per_partition + block_n - 1) // block_n,
+                        1,
+                        (input_size_per_partition + block_k - 1) // block_k,
+                        1,
+                        dtype=torch.float32,
+                    ),
+                    input_dim=2,
+                    output_dim=0,
+                    weight_loader=weight_loader,
+                )
+                weight_scale[:] = torch.finfo(torch.float32).min
+                layer.register_parameter("weight_scale", weight_scale)
+                layer.register_parameter("input_scale", None)
+            else:
+                # WEIGHT SCALE
+                weight_scale = PerTensorScaleParameter(
+                    data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+                    weight_loader=weight_loader,
+                )
+                weight_scale[:] = torch.finfo(torch.float32).min
+                layer.register_parameter("weight_scale", weight_scale)
+                # INPUT SCALE
+                scale = PerTensorScaleParameter(
+                    data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+                    weight_loader=weight_loader,
+                )
 
-            scale[:] = torch.finfo(torch.float32).min
-            layer.register_parameter("input_scale", scale)
+                scale[:] = torch.finfo(torch.float32).min
+                layer.register_parameter("input_scale", scale)
 
     def process_weights_after_loading(self, layer: Module) -> None:
-        weight = layer.weight
-        max_w_scale = layer.weight_scale.max()
-        if not (layer.weight_scale == layer.weight_scale[0]).all():
-            max_w_scale, weight = requantize_with_max_scale(
-                layer.weight, layer.weight_scale, layer.logical_widths
+        if self.quant_config.is_block_quant:
+            layer.weight_scale = Parameter(
+                layer.weight_scale.squeeze(), requires_grad=False
             )
-        layer.weight = Parameter(weight.t(), requires_grad=False)
-        layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
-        layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
+        else:
+            weight = layer.weight
+            max_w_scale = layer.weight_scale.max()
+            if not (layer.weight_scale == layer.weight_scale[0]).all():
+                max_w_scale, weight = requantize_with_max_scale(
+                    layer.weight, layer.weight_scale, layer.logical_widths
+                )
+            layer.weight = Parameter(weight.t(), requires_grad=False)
+            layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
+            layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
 
     def apply(
         self,
@@ -428,13 +536,29 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.fp8_linear.apply(
-            input=x,
-            weight=layer.weight,
-            weight_scale=layer.weight_scale,
-            input_scale=layer.input_scale,
-            bias=bias,
-        )
+        if self.quant_config.is_block_quant:
+            results = self.w8a8_block_fp8_linear.apply(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=layer.input_scale,
+                bias=bias,
+            )
+        else:
+            results = self.fp8_linear.apply(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=layer.input_scale,
+                bias=bias,
+            )
+
+        if (
+            self.slice_outputs_padding
+            and self.original_output_size_per_partition is not None
+        ):
+            results = results[:, : self.original_output_size_per_partition]
+        return results
 
 
 class ModelOptFp8MoEMethod(FusedMoEMethodBase):
@@ -459,6 +583,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
 
         self.cutlass_fp8_supported = cutlass_fp8_supported()
         self.flashinfer_moe_backend: FlashinferMoeBackend | None = None
+        self.moe_backend: str | None = None
         if envs.VLLM_USE_FLASHINFER_MOE_FP8 and has_flashinfer_moe():
             self.flashinfer_moe_backend = get_flashinfer_moe_backend()
             if (
@@ -474,6 +599,8 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             logger.info_once(
                 f"Using FlashInfer {self.flashinfer_moe_backend.value} kernels"
             )
+
+        self.moe_backend = self.flashinfer_moe_backend
 
     def maybe_make_prepare_finalize(
         self,
@@ -553,53 +680,134 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_weight", w2_weight)
 
         if self.quant_config.is_checkpoint_fp8_serialized:
-            # WEIGHT SCALES - Per-tensor scaling for ModelOpts
-            # For gated MoE, allocate 2 scales for w1 and w3 respectively.
-            # They will be combined to a single scale after weight loading.
-            # For non-gated MoE, allocate 1 scale for w13.
-            if self.moe.is_act_and_mul:
-                w13_weight_scale_shape = (num_experts, 2)
+            if self.quant_config.is_block_quant:
+                assert self.quant_config.block_size is not None
+                layer.weight_block_size = self.quant_config.block_size
+                block_n, block_k = self.quant_config.block_size
+
+                # BLOCK SCALES
+                w13_weight_scale = BlockQuantScaleParameter(
+                    data=torch.ones(
+                        num_experts,
+                        (2 if self.moe.is_act_and_mul else 1)
+                        * ((intermediate_size_per_partition + block_n - 1) // block_n),
+                        1,
+                        (hidden_size + block_k - 1) // block_k,
+                        1,
+                        dtype=torch.float32,
+                    ),
+                    input_dim=3,
+                    output_dim=1,
+                    weight_loader=weight_loader,
+                )
+                layer.register_parameter("w13_weight_scale", w13_weight_scale)
+                w2_weight_scale = BlockQuantScaleParameter(
+                    data=torch.ones(
+                        num_experts,
+                        (hidden_size + block_n - 1) // block_n,
+                        1,
+                        (intermediate_size_per_partition + block_k - 1) // block_k,
+                        1,
+                        dtype=torch.float32,
+                    ),
+                    input_dim=3,
+                    output_dim=1,
+                    weight_loader=weight_loader,
+                )
+                layer.register_parameter("w2_weight_scale", w2_weight_scale)
+                layer.w13_input_scale = None
+                layer.w2_input_scale = None
             else:
-                w13_weight_scale_shape = (num_experts, 1)
-            w13_weight_scale = PerTensorScaleParameter(
-                data=torch.full(
-                    w13_weight_scale_shape,
-                    1.0,
-                    dtype=torch.float32,
-                ),
-                weight_loader=weight_loader,
-            )
-            w2_weight_scale = PerTensorScaleParameter(
-                data=torch.full((num_experts,), 1.0, dtype=torch.float32),
-                weight_loader=weight_loader,
-            )
-            layer.register_parameter("w13_weight_scale", w13_weight_scale)
-            layer.register_parameter("w2_weight_scale", w2_weight_scale)
+                # WEIGHT SCALES - Per-tensor scaling for ModelOpts
+                # For gated MoE, allocate 2 scales for w1 and w3 respectively.
+                # They will be combined to a single scale after weight loading.
+                # For non-gated MoE, allocate 1 scale for w13.
+                if self.moe.is_act_and_mul:
+                    w13_weight_scale_shape = (num_experts, 2)
+                else:
+                    w13_weight_scale_shape = (num_experts, 1)
+                w13_weight_scale = PerTensorScaleParameter(
+                    data=torch.full(
+                        w13_weight_scale_shape,
+                        1.0,
+                        dtype=torch.float32,
+                    ),
+                    weight_loader=weight_loader,
+                )
+                w2_weight_scale = PerTensorScaleParameter(
+                    data=torch.full((num_experts,), 1.0, dtype=torch.float32),
+                    weight_loader=weight_loader,
+                )
+                layer.register_parameter("w13_weight_scale", w13_weight_scale)
+                layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-            # Set weight loader attributes for scales
-            extra_weight_attrs.update(
-                {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
-            )
+                # Set weight loader attributes for scales
+                extra_weight_attrs.update(
+                    {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
+                )
 
-            # INPUT SCALES - Per-tensor scaling for ModelOpt
-            w13_input_scale = PerTensorScaleParameter(
-                data=torch.full((num_experts,), 1.0, dtype=torch.float32),
-                weight_loader=weight_loader,
-            )
-            w2_input_scale = PerTensorScaleParameter(
-                data=torch.full((num_experts,), 1.0, dtype=torch.float32),
-                weight_loader=weight_loader,
-            )
-            layer.register_parameter("w13_input_scale", w13_input_scale)
-            layer.register_parameter("w2_input_scale", w2_input_scale)
+                # INPUT SCALES - Per-tensor scaling for ModelOpt
+                w13_input_scale = PerTensorScaleParameter(
+                    data=torch.full((num_experts,), 1.0, dtype=torch.float32),
+                    weight_loader=weight_loader,
+                )
+                w2_input_scale = PerTensorScaleParameter(
+                    data=torch.full((num_experts,), 1.0, dtype=torch.float32),
+                    weight_loader=weight_loader,
+                )
+                layer.register_parameter("w13_input_scale", w13_input_scale)
+                layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
+        layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
+
+        if self.quant_config.is_block_quant:
+            self._process_weights_after_loading_blockscale(layer)
+        else:
+            self._process_weights_after_loading_per_tensor(layer)
+
+    def _process_weights_after_loading_blockscale(self, layer: torch.nn.Module) -> None:
+        w13_weight = layer.w13_weight
+        w2_weight = layer.w2_weight
+
+        block_shape = self.quant_config.block_size
+        assert block_shape is not None
+
+        # Squeeze the scales first
+        layer.w13_weight_scale = Parameter(
+            layer.w13_weight_scale.squeeze(), requires_grad=False
+        )
+        layer.w2_weight_scale = Parameter(
+            layer.w2_weight_scale.squeeze(), requires_grad=False
+        )
+
+        # Apply padding if needed
+        required_padding = layer.w13_weight_scale.size(-2) * block_shape[
+            0
+        ] - w13_weight.size(-2)
+        # required_padding = w13_weight.size(-2) % block_shape[0]
+        if required_padding != 0:
+            layer.w13_weight = Parameter(
+                torch.nn.functional.pad(w13_weight, (0, 0, 0, required_padding)),
+                requires_grad=False,
+            )
+            layer.w2_weight = Parameter(
+                torch.nn.functional.pad(w2_weight, (0, required_padding, 0, 0)),
+                requires_grad=False,
+            )
+
+        # FlashInfer weight transformations (must be done before DeepGEMM preprocessing)
+        if self.flashinfer_moe_backend is not None:
+            if self.moe.is_act_and_mul:
+                layer.w13_weight.data = swap_w13_to_w31(layer.w13_weight.data)
+            if self.flashinfer_moe_backend == FlashinferMoeBackend.TENSORRT_LLM:
+                rotate_flashinfer_fp8_moe_weights(layer.w13_weight, layer.w2_weight)
+
+    def _process_weights_after_loading_per_tensor(self, layer: torch.nn.Module) -> None:
         """Process FP8 MoE weights after loading from serialized checkpoint.
         Only supports pre-quantized checkpoints with FP8 weights and scales.
         """
-
-        layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
-        layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
 
         from vllm._custom_ops import scaled_fp8_quant
         from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
@@ -681,17 +889,28 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         if self.flashinfer_moe_backend == FlashinferMoeBackend.TENSORRT_LLM:
             return None
 
-        return fp8_w8a8_moe_quant_config(
-            w1_scale=layer.w13_weight_scale,
-            g1_alphas=layer.output1_scales_gate_scalar.squeeze(),
-            w2_scale=layer.w2_weight_scale,
-            g2_alphas=layer.output2_scales_scalar.squeeze(),
-            a1_scale=layer.w13_input_scale,
-            a1_gscale=layer.w13_input_scale,
-            a2_scale=layer.w2_input_scale,
-            a2_gscale=layer.w2_input_scale_inv,
-            per_act_token_quant=False,
-        )
+        if self.quant_config.is_block_quant:
+            assert self.quant_config.block_size is not None
+            block_shape = list(self.quant_config.block_size)
+            return fp8_w8a8_moe_quant_config(
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                a1_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+                block_shape=block_shape,
+            )
+        else:
+            return fp8_w8a8_moe_quant_config(
+                w1_scale=layer.w13_weight_scale,
+                g1_alphas=layer.output1_scales_gate_scalar.squeeze(),
+                w2_scale=layer.w2_weight_scale,
+                g2_alphas=layer.output2_scales_scalar.squeeze(),
+                a1_scale=layer.w13_input_scale,
+                a1_gscale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+                a2_gscale=layer.w2_input_scale_inv,
+                per_act_token_quant=False,
+            )
 
     def apply(
         self,
@@ -769,6 +988,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 global_num_experts=global_num_experts,
                 expert_map=expert_map,
                 apply_router_weight_on_input=apply_router_weight_on_input,
+                use_deepseek_fp8_block_scale=self.quant_config.is_block_quant,
             )
         else:
             from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
@@ -787,6 +1007,8 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 global_num_experts=global_num_experts,
                 expert_map=expert_map,
                 apply_router_weight_on_input=apply_router_weight_on_input,
+                allow_cutlass_block_scaled_grouped_gemm=self.quant_config.is_block_quant,
+                allow_deep_gemm=self.moe_backend == "DeepGEMM",
             )
 
 
@@ -825,6 +1047,10 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
     @classmethod
     def get_min_capability(cls) -> int:
         return 80
+
+    @property
+    def is_block_quant(self) -> bool:
+        return True
 
     @classmethod
     def override_quantization_method(

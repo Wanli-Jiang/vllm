@@ -99,6 +99,7 @@ class NemotronHMLP(nn.Module):
             quant_config=quant_config,
             disable_tp=is_sequence_parallel,
             prefix=f"{prefix}.up_proj",
+            slice_padding=False,
         )
         self.down_proj = RowParallelLinear(
             input_size=intermediate_size,
@@ -108,6 +109,7 @@ class NemotronHMLP(nn.Module):
             reduce_results=reduce_results,
             disable_tp=is_sequence_parallel,
             prefix=f"{prefix}.down_proj",
+            slice_padding=False,
         )
         self.act_fn = ReLUSquaredActivation()
 

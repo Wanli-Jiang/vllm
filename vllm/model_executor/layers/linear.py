@@ -435,6 +435,9 @@ class ColumnParallelLinear(LinearBase):
                         (e.g. model.layers.0.qkv_proj)
         return_bias: If true, return bias together with outputs in forward pass.
         disable_tp: If true, weights matrix won't be sharded through tp rank.
+        slice_padding: If true, slice the output to the original output size. This is for quantization method that
+            needs padding for GEMM and then needs slicing back to the original output size.
+            Default is True to keep backward compatibility.
     """
 
     def __init__(
@@ -451,6 +454,7 @@ class ColumnParallelLinear(LinearBase):
         *,
         return_bias: bool = True,
         disable_tp: bool = False,
+        slice_padding: bool = True,
     ):
         # Divide the weight matrix along the last dimension.
         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
@@ -463,6 +467,7 @@ class ColumnParallelLinear(LinearBase):
             self.output_partition_sizes = [
                 divide(output_size, self.tp_size) for output_size in self.output_sizes
             ]
+        self.slice_padding = slice_padding
 
         super().__init__(
             input_size,
@@ -493,6 +498,7 @@ class ColumnParallelLinear(LinearBase):
                 if self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
                 else self.weight_loader
             ),
+            slice_outputs_padding=self.slice_padding,
         )
         if bias:
             self.bias = Parameter(
@@ -552,6 +558,20 @@ class ColumnParallelLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
+
+        if self.quant_config.is_block_quant:
+            if isinstance(param, BlockQuantScaleParameter):
+                loaded_weight = param.maybe_padding_scale(
+                    loaded_weight,
+                    self.tp_size,
+                    param.output_dim,
+                    param.shape[param.output_dim],
+                )
+            else:
+                loaded_weight = param.maybe_padding_weight(
+                    loaded_weight, self.tp_size, param.output_dim
+                )
+
         param.load_column_parallel_weight(loaded_weight=loaded_weight)
 
     def forward(
@@ -622,6 +642,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         *,
         return_bias: bool = True,
         disable_tp: bool = False,
+        slice_padding: bool = True,
     ):
         self.output_sizes = output_sizes
         self.tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
@@ -639,6 +660,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             prefix=prefix,
             return_bias=return_bias,
             disable_tp=disable_tp,
+            slice_padding=slice_padding,
         )
 
     def weight_loader(
@@ -793,10 +815,20 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         An example of a model with these fused layers:
         https://huggingface.co/microsoft/Phi-3-mini-4k-instruct
         """
+        if isinstance(param, BlockQuantScaleParameter):
+            assert self.quant_method is not None
+            # Assume the weight block size has been set by quant method
+            assert hasattr(self, "weight_block_size")
+            weight_block_size = self.weight_block_size
+            assert weight_block_size is not None
+            block_n, _ = weight_block_size[0], weight_block_size[1]
+        else:
+            block_n = 1
 
         current_shard_offset = 0
         shard_offsets: list[tuple[int, int, int]] = []
         for i, output_size in enumerate(self.output_sizes):
+            output_size = (output_size + block_n - 1) // block_n
             shard_offsets.append((i, current_shard_offset, output_size))
             current_shard_offset += output_size
 
@@ -843,14 +875,21 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             weight_block_size = self.weight_block_size
             assert weight_block_size is not None
             block_n, _ = weight_block_size[0], weight_block_size[1]
-            shard_offset = (
-                (sum(self.output_sizes[:loaded_shard_id]) + block_n - 1) // block_n
-            ) // self.tp_size
-            shard_size = (
-                (self.output_sizes[loaded_shard_id] + block_n - 1)
-                // block_n
-                // self.tp_size
-            )
+            unshard_offset = (
+                sum(self.output_sizes[:loaded_shard_id]) + block_n - 1
+            ) // block_n
+            unshard_size = (self.output_sizes[loaded_shard_id] + block_n - 1) // block_n
+            shard_offset = unshard_offset // self.tp_size
+            shard_size = (unshard_size + self.tp_size - 1) // self.tp_size
+            # Corner case: if the unshard_size is less than the tp_size,
+            # expand the loaded_weight to the tp_size.
+            if unshard_size < self.tp_size:
+                assert unshard_size == 1, (
+                    "Unsupported unshard_size which is less than the tp_size."
+                )
+                expand_shape = [-1] * loaded_weight.dim()
+                expand_shape[param.output_dim] = unshard_size * self.tp_size
+                loaded_weight = loaded_weight.expand(expand_shape)
         else:
             shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
             shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
@@ -906,6 +945,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         *,
         return_bias: bool = True,
         disable_tp: bool = False,
+        slice_padding: bool = True,
     ):
         self.hidden_size = hidden_size
         self.head_size = head_size
@@ -943,6 +983,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             prefix=prefix,
             return_bias=return_bias,
             disable_tp=disable_tp,
+            slice_padding=slice_padding,
         )
 
     def _get_shard_offset_mapping(self, loaded_shard_id: str):
@@ -1286,6 +1327,7 @@ class RowParallelLinear(LinearBase):
         *,
         return_bias: bool = True,
         disable_tp: bool = False,
+        slice_padding: bool = True,
     ):
         # Divide the weight matrix along the first dimension.
         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
@@ -1293,6 +1335,7 @@ class RowParallelLinear(LinearBase):
         self.input_size_per_partition = divide(input_size, self.tp_size)
         self.output_size_per_partition = output_size
         self.output_partition_sizes = [output_size]
+        self.slice_padding = slice_padding
 
         super().__init__(
             input_size,
@@ -1382,6 +1425,19 @@ class RowParallelLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
+
+        if self.quant_config.is_block_quant:
+            if isinstance(param, BlockQuantScaleParameter):
+                loaded_weight = param.maybe_padding_scale(
+                    loaded_weight,
+                    self.tp_size,
+                    param.input_dim,
+                    param.shape[param.input_dim],
+                )
+            else:
+                loaded_weight = param.maybe_padding_weight(
+                    loaded_weight, self.tp_size, param.input_dim
+                )
 
         param.load_row_parallel_weight(loaded_weight=loaded_weight)
 

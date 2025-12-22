@@ -1215,7 +1215,10 @@ class FusedMoE(CustomOp):
             is_per_tensor = (
                 "weight_scale_2" in weight_name
                 if uses_weight_scale_2
-                else "weight_scale" in weight_name
+                else (
+                    "weight_scale" in weight_name
+                    and not self.quant_method.quant_config.is_block_quant
+                )
             ) or "input_scale" in weight_name
             if is_per_tensor:
                 self._load_per_tensor_weight_scale(
@@ -1242,6 +1245,38 @@ class FusedMoE(CustomOp):
                         tp_rank=self.tp_rank,
                     )
                     return True if return_success else None
+
+            # Padding for block quantization.
+            if self.quant_method.quant_config.is_block_quant:
+                if "w13_weight_scale" in weight_name:
+                    # param shape included the `num_experts` dimension at dim=0, so that we need to subtract 1 from the output_dim of loaded_weight.
+                    shard_dim = param.output_dim - 1
+                    assert shard_dim == 0, "Unsupported shard_dim for w13_weight_scale."
+                    block_len = self.quant_method.quant_config.block_size[0]
+                    basic_shard_size = (
+                        self.intermediate_size_per_partition + block_len - 1
+                    ) // block_len
+                    loaded_weight = param.maybe_padding_scale(
+                        loaded_weight, self.tp_size, shard_dim, basic_shard_size
+                    )
+                    self._load_combined_w13_weight_scale(
+                        shard_dim=shard_dim,
+                        loaded_weight=loaded_weight,
+                        param=expert_data,
+                        tp_rank=self.tp_rank,
+                    )
+                    return True if return_success else None
+                elif "w2_weight_scale" in weight_name:
+                    # param shape included the `num_experts` dimension at dim=0, so that we need to subtract 1 from the input_dim of loaded_weight.
+                    shard_dim = param.input_dim - 1
+                    assert shard_dim == 2, "Unsupported shard_dim for w2_weight_scale."
+                    block_len = self.quant_method.quant_config.block_size[1]
+                    basic_shard_size = (
+                        self.intermediate_size_per_partition + block_len - 1
+                    ) // block_len
+                    loaded_weight = param.maybe_padding_scale(
+                        loaded_weight, self.tp_size, shard_dim, basic_shard_size
+                    )
 
             # For other weights, call _load_model_weight_or_group_weight_scale()
             # to load it.
